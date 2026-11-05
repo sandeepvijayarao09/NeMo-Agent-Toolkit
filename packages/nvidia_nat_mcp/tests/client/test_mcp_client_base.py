@@ -29,8 +29,11 @@ from mcp.server.fastmcp.server import FastMCP
 from mcp.types import BlobResourceContents
 from mcp.types import CallToolResult
 from mcp.types import EmbeddedResource
+from mcp.types import ListToolsResult
+from mcp.types import PaginatedRequestParams
 from mcp.types import TextContent
 from mcp.types import TextResourceContents
+from mcp.types import Tool
 
 from nat.plugins.mcp.client.client_base import MCPBaseClient
 from nat.plugins.mcp.client.client_base import MCPSSEClient
@@ -258,7 +261,7 @@ class TaskBoundAsyncContextManager:
             self.client.list_tools_call_count += 1
             if self.client.list_tools_call_count == 1:
                 raise ConnectionError("Connection lost")
-            return MagicMock(tools=[])
+            return ListToolsResult(tools=[])
 
         mock_session.list_tools.side_effect = mock_list_tools
         return mock_session
@@ -329,7 +332,7 @@ async def test_reconnect_success_after_failure():
         call_count += 1
         if call_count == 1:
             raise ConnectionError("First call fails")
-        return MagicMock(tools=[])
+        return ListToolsResult(tools=[])
 
     client.list_tools_side_effect = mock_list_tools
 
@@ -340,6 +343,54 @@ async def test_reconnect_success_after_failure():
 
         # Should have been called twice (fail, then succeed)
         assert call_count == 2
+
+
+async def test_get_tools_follows_pagination_cursor():
+    """Tools on every page of a paginated tools/list response should be returned, not only the first page."""
+    client = MockMCPClient(transport="streamable-http")
+    pages = {
+        None: ListToolsResult(tools=[Tool(name="tool_a", inputSchema={"type": "object"})], nextCursor="page-2"),
+        "page-2": ListToolsResult(tools=[Tool(name="tool_b", inputSchema={"type": "object"})], nextCursor="page-3"),
+        "page-3": ListToolsResult(tools=[Tool(name="tool_c", inputSchema={"type": "object"})]),
+    }
+    requested_cursors = []
+
+    async def paginated_list_tools(cursor: str | None = None, *, params: PaginatedRequestParams | None = None):
+        cursor = params.cursor if params is not None else cursor
+        requested_cursors.append(cursor)
+        return pages[cursor]
+
+    client.list_tools_side_effect = paginated_list_tools
+
+    async with client:
+        tools = await client.get_tools()
+        assert set(tools) == {"tool_a", "tool_b", "tool_c"}
+        assert requested_cursors == [None, "page-2", "page-3"]
+
+        # A tool on a later page can be looked up by name
+        tool_c = await client.get_tool("tool_c")
+        assert tool_c.name == "tool_c"
+
+
+async def test_get_tools_stops_on_repeated_pagination_cursor():
+    """A server that keeps returning a cursor it already sent should not make get_tools loop forever."""
+    client = MockMCPClient(transport="streamable-http")
+    requested_cursors = []
+
+    async def looping_list_tools(cursor: str | None = None, *, params: PaginatedRequestParams | None = None):
+        cursor = params.cursor if params is not None else cursor
+        requested_cursors.append(cursor)
+        return ListToolsResult(tools=[Tool(name=f"tool_{len(requested_cursors)}", inputSchema={"type": "object"})],
+                               nextCursor="same-page")
+
+    client.list_tools_side_effect = looping_list_tools
+
+    async with client:
+        with anyio.fail_after(5):
+            tools = await client.get_tools()
+
+    assert set(tools) == {"tool_1", "tool_2"}
+    assert requested_cursors == [None, "same-page"]
 
 
 async def test_reconnect_exits_transport_stack_in_lifecycle_task():
@@ -417,7 +468,7 @@ async def test_reconnect_backoff_timing():
         call_count += 1
         if call_count == 1:
             raise ConnectionError("Trigger reconnect")
-        return MagicMock(tools=[])
+        return ListToolsResult(tools=[])
 
     client.list_tools_side_effect = mock_list_tools
 
@@ -669,7 +720,7 @@ class TransportChildFailureMockClient(MCPBaseClient):
         async with anyio.create_task_group() as tg:
             tg.start_soon(self._background_child)
             session = AsyncMock(spec=ClientSession)
-            session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
+            session.list_tools = AsyncMock(return_value=ListToolsResult(tools=[]))
             yield session
 
 
@@ -733,7 +784,7 @@ class HangingConnectMockClient(MCPBaseClient):
             self.connect_started.set()
             await asyncio.Event().wait()  # park until cancelled
         session = AsyncMock(spec=ClientSession)
-        session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
+        session.list_tools = AsyncMock(return_value=ListToolsResult(tools=[]))
         yield session
 
 
